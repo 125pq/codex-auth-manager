@@ -2,6 +2,7 @@
 setlocal
 
 cd /d "%~dp0"
+set "CODEX_MANAGER_START_HIDDEN=1"
 
 if not exist node_modules (
   echo Installing dependencies...

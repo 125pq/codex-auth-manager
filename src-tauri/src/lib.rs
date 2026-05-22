@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -1576,6 +1577,15 @@ fn initialize_tray<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
+fn should_start_hidden() -> bool {
+    env::var("CODEX_MANAGER_START_HIDDEN")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// 获取用量绑定映射路径
 fn get_usage_bindings_path() -> Result<PathBuf, String> {
     let dir = get_app_data_dir()?;
@@ -2775,6 +2785,9 @@ pub fn run() {
             }
             start_session_watcher();
             initialize_tray(&app.handle())?;
+            if should_start_hidden() {
+                let _ = hide_to_tray_internal(&app.handle());
+            }
             start_background_auto_refresh(&app.handle());
             Ok(())
         })
