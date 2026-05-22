@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{Local, TimeZone};
 use std::collections::HashMap;
 use std::fs;
@@ -25,9 +26,180 @@ const TRAY_MENU_EXIT_ID: &str = "tray-exit";
 const MIN_VALID_EPOCH_MS: i64 = 946684800000; // 2000-01-01T00:00:00Z
 const MAX_VALID_EPOCH_MS: i64 = 4102444800000; // 2100-01-01T00:00:00Z
 const DEFAULT_LOGIN_TIMEOUT_SECONDS: u64 = 180;
+const ENCRYPTED_JSON_FORMAT: &str = "codex-manager-encrypted-json";
+const ENCRYPTED_JSON_VERSION: u8 = 1;
+const ENCRYPTED_JSON_ALGORITHM: &str = "windows-dpapi-current-user";
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EncryptedJsonFile {
+    format: String,
+    version: u8,
+    algorithm: String,
+    ciphertext: String,
+}
+
+fn parse_encrypted_json_file(content: &str) -> Option<EncryptedJsonFile> {
+    serde_json::from_str::<EncryptedJsonFile>(content)
+        .ok()
+        .filter(|file| file.format == ENCRYPTED_JSON_FORMAT)
+}
+
+#[cfg(windows)]
+fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptProtectData(
+            &mut input,
+            null(),
+            null(),
+            null_mut(),
+            null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let encrypted = unsafe {
+        let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
+        let bytes = slice.to_vec();
+        LocalFree(output.pbData as *mut core::ffi::c_void);
+        bytes
+    };
+
+    Ok(encrypted)
+}
+
+#[cfg(windows)]
+fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            null_mut(),
+            null(),
+            null_mut(),
+            null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let decrypted = unsafe {
+        let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
+        let bytes = slice.to_vec();
+        LocalFree(output.pbData as *mut core::ffi::c_void);
+        bytes
+    };
+
+    Ok(decrypted)
+}
+
+#[cfg(not(windows))]
+fn dpapi_protect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Encrypted local storage currently requires Windows DPAPI".to_string())
+}
+
+#[cfg(not(windows))]
+fn dpapi_unprotect(_data: &[u8]) -> Result<Vec<u8>, String> {
+    Err("Encrypted local storage currently requires Windows DPAPI".to_string())
+}
+
+fn encrypt_json_content(content: &str) -> Result<String, String> {
+    let ciphertext = dpapi_protect(content.as_bytes())?;
+    let encrypted = EncryptedJsonFile {
+        format: ENCRYPTED_JSON_FORMAT.to_string(),
+        version: ENCRYPTED_JSON_VERSION,
+        algorithm: ENCRYPTED_JSON_ALGORITHM.to_string(),
+        ciphertext: BASE64.encode(ciphertext),
+    };
+
+    serde_json::to_string_pretty(&encrypted).map_err(|e| e.to_string())
+}
+
+fn decrypt_json_content(encrypted: EncryptedJsonFile) -> Result<String, String> {
+    if encrypted.version != ENCRYPTED_JSON_VERSION {
+        return Err(format!(
+            "Unsupported encrypted JSON version: {}",
+            encrypted.version
+        ));
+    }
+    if encrypted.algorithm != ENCRYPTED_JSON_ALGORITHM {
+        return Err(format!(
+            "Unsupported encrypted JSON algorithm: {}",
+            encrypted.algorithm
+        ));
+    }
+
+    let ciphertext = BASE64
+        .decode(encrypted.ciphertext.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let plaintext = dpapi_unprotect(&ciphertext)?;
+    String::from_utf8(plaintext).map_err(|e| e.to_string())
+}
+
+fn read_managed_json_file(path: &Path) -> Result<String, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+
+    if let Some(encrypted) = parse_encrypted_json_file(&content) {
+        return decrypt_json_content(encrypted);
+    }
+
+    if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
+        let encrypted = encrypt_json_content(&content)?;
+        fs::write(path, encrypted).map_err(|e| e.to_string())?;
+    }
+
+    Ok(content)
+}
+
+fn write_managed_json_file(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let encrypted = encrypt_json_content(content)?;
+    fs::write(path, encrypted).map_err(|e| e.to_string())
+}
 
 /// 获取应用数据目录
 fn get_app_data_dir() -> Result<PathBuf, String> {
@@ -178,14 +350,14 @@ fn load_accounts_store() -> Result<String, String> {
         return Err("Store file not found".to_string());
     }
 
-    fs::read_to_string(&path).map_err(|e| e.to_string())
+    read_managed_json_file(&path)
 }
 
 /// 保存账号存储数据
 #[tauri::command]
 fn save_accounts_store(data: String) -> Result<(), String> {
     let path = get_accounts_store_path()?;
-    fs::write(&path, data).map_err(|e| e.to_string())
+    write_managed_json_file(&path, &data)
 }
 
 fn load_accounts_store_data() -> Result<TrayAccountsStore, String> {
@@ -209,7 +381,7 @@ fn load_accounts_store_data() -> Result<TrayAccountsStore, String> {
         });
     }
 
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let content = read_managed_json_file(&path)?;
     serde_json::from_str(&content).map_err(|e| e.to_string())
 }
 
@@ -708,7 +880,7 @@ fn read_codex_auth() -> Result<String, String> {
 #[tauri::command]
 fn save_account_auth(account_id: String, auth_config: String) -> Result<(), String> {
     let path = get_account_auth_path(&account_id)?;
-    fs::write(&path, auth_config).map_err(|e| e.to_string())
+    write_managed_json_file(&path, &auth_config)
 }
 
 /// 读取指定账号 auth
@@ -718,7 +890,7 @@ fn read_account_auth(account_id: String) -> Result<String, String> {
     if !path.exists() {
         return Err("Account auth not found".to_string());
     }
-    fs::read_to_string(&path).map_err(|e| e.to_string())
+    read_managed_json_file(&path)
 }
 
 /// 删除指定账号 auth
@@ -1433,7 +1605,7 @@ fn load_usage_bindings_unlocked() -> Result<UsageBindingsStore, String> {
             bindings: HashMap::new(),
         });
     }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let content = read_managed_json_file(&path)?;
     let store: UsageBindingsStore = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     Ok(store)
 }
@@ -1441,7 +1613,7 @@ fn load_usage_bindings_unlocked() -> Result<UsageBindingsStore, String> {
 fn save_usage_bindings_unlocked(store: &UsageBindingsStore) -> Result<(), String> {
     let path = get_usage_bindings_path()?;
     let data = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())
+    write_managed_json_file(&path, &data)
 }
 
 fn update_usage_bindings(account_id: &str, binding: SessionBinding) -> Result<(), String> {

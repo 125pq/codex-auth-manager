@@ -75,11 +75,12 @@ npm run tauri build
 
 ## 数据与隐私
 
-数据全部保存在本地文件中（**不会上传**），但目前为 **明文 JSON** 存储：
+数据全部保存在本地文件中（**不会上传**）。账号管理器自己的 JSON 存储会使用 Windows DPAPI 按当前系统用户加密；旧版明文文件在读取后会自动迁移为加密格式。
 
-- **账号列表与配置**：`%LOCALAPPDATA%\codex-manager\accounts.json`
-- **账号凭据**：`%USERPROFILE%\.codex_manager\auths\{accountId}.json`
-- **当前 Codex 配置**：`%USERPROFILE%\.codex\auth.json`
+- **账号列表与配置**：`%LOCALAPPDATA%\codex-manager\accounts.json`（加密）
+- **账号凭据**：`%USERPROFILE%\.codex_manager\auths\{accountId}.json`（加密）
+- **用量绑定缓存**：`%LOCALAPPDATA%\codex-manager\usage-bindings.json`（加密）
+- **当前 Codex 配置**：`%USERPROFILE%\.codex\auth.json`（保持 Codex 官方格式，仍为明文）
 - **用量来源**：`https://chatgpt.com/backend-api/wham/usage`（使用本地账号 token）
 
 ## 已知限制
